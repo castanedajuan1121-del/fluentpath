@@ -180,7 +180,7 @@ const defState = () => ({
   skills:{pron:20,listen:20,speak:20,write:20,gram:20,vocab:20},
   xp:0, days:{}, vocab:[], mistakes:[], evals:[], weekly:{}, startDate:todayKey(),
   prefs:{interests:["Películas","Series"], style:"Mixto", minutes:45, rate:0.95},
-  models:[], modelMode:"auto", active:null, available:[]
+  models:[], modelMode:"auto", active:null, available:[], fresh:true, updatedAt:0
 });
 let S;
 function load(){
@@ -189,7 +189,8 @@ function load(){
   if(DEFAULT_KEY && (!S.apiKey || S.keySrc!=="user") && S.apiKey!==DEFAULT_KEY){ S.apiKey=DEFAULT_KEY; S.keySrc="default"; S.active=null; }
   S._st = S.active?"ok":"idle";
 }
-function save(){ try{ localStorage.setItem(STORE, JSON.stringify(S)); }catch(e){} }
+function saveLocal(){ try{ localStorage.setItem(STORE, JSON.stringify(S)); }catch(e){} }
+function save(){ S.updatedAt=Date.now(); saveLocal(); if(typeof scheduleSync==="function") scheduleSync(); }
 
 /* ---------------- HELPERS ---------------- */
 function todayKey(d=new Date()){ const z=n=>String(n).padStart(2,"0"); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
@@ -442,6 +443,105 @@ const N = {
   list: k=>r=>{ if(Array.isArray(r)) return {[k]:r}; r=unwrap(r); r[k]=arr(r[k]); return r; }
 };
 
+/* ===== SINCRONIZACIÓN ENTRE DISPOSITIVOS =====
+   Tu progreso se cifra con la misma clave de acceso (AES-256-GCM) y se guarda en la rama "progress" de tu repo de GitHub.
+   GitHub solo ve datos cifrados. */
+const SYNC = { token:/^%%/.test("%%SYNC_TOKEN%%")?"":"%%SYNC_TOKEN%%", repo:/^%%/.test("%%SYNC_REPO%%")?"":"%%SYNC_REPO%%",
+  branch:"progress", path:"progress.enc.json", sha:null, branchOk:false, timer:null, busy:false, again:false, state:"off", last:0, err:"" };
+const DEVICE_FIELDS = ["apiKey","active","available","models","_st","_stTxt","keySrc","syncBase","fresh"];
+const syncOn = () => !!(SYNC.token && SYNC.repo && window.FP_KEY && window.crypto && crypto.subtle);
+const b64ToU8 = s => { const b=atob(s), u=new Uint8Array(b.length); for(let i=0;i<b.length;i++) u[i]=b.charCodeAt(i); return u; };
+let syncKey=null;
+async function getSyncKey(){ if(!syncKey) syncKey=await crypto.subtle.importKey("raw",b64ToU8(window.FP_KEY),{name:"AES-GCM"},false,["encrypt","decrypt"]); return syncKey; }
+async function gh(path,opt={}){
+  return fetch("https://api.github.com/repos/"+SYNC.repo+path,{...opt,cache:"no-store",headers:{"Authorization":"Bearer "+SYNC.token,"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28",...(opt.body?{"Content-Type":"application/json"}:{})}});
+}
+function ghErr(r,what){ return new Error(r.status===401?"El token de sincronización no es válido o expiró (secreto SYNC_TOKEN).":r.status===403||r.status===404?`El token no tiene permiso para ${what} (necesita Contents: Read and write en el repo).`:`GitHub respondió ${r.status} al ${what}.`); }
+function syncPayload(){ const o={}; for(const k in S) if(!DEVICE_FIELDS.includes(k)) o[k]=S[k]; return o; }
+async function ensureBranch(){
+  if(SYNC.branchOk) return;
+  let r=await gh(`/git/ref/heads/${SYNC.branch}`);
+  if(r.status===404){
+    const m=await gh(`/git/ref/heads/main`); if(!m.ok) throw ghErr(m,"leer el repositorio");
+    const sha=(await m.json()).object.sha;
+    r=await gh(`/git/refs`,{method:"POST",body:JSON.stringify({ref:`refs/heads/${SYNC.branch}`,sha})});
+    if(!r.ok && r.status!==422) throw ghErr(r,"crear la rama de progreso");
+  } else if(!r.ok) throw ghErr(r,"leer la rama de progreso");
+  SYNC.branchOk=true;
+}
+async function syncPull(){
+  const r=await gh(`/contents/${SYNC.path}?ref=${SYNC.branch}&t=${Date.now()}`);
+  if(r.status===404){ SYNC.sha=null; return null; }
+  if(!r.ok) throw ghErr(r,"leer tu progreso");
+  const d=await r.json(); SYNC.sha=d.sha;
+  const file=JSON.parse(new TextDecoder().decode(b64ToU8(d.content.replace(/\s/g,""))));
+  try{ const pt=await crypto.subtle.decrypt({name:"AES-GCM",iv:b64ToU8(file.iv)},await getSyncKey(),b64ToU8(file.ct)); return JSON.parse(new TextDecoder().decode(pt)); }
+  catch(e){ return {__oldKey:true}; } // cifrado con una clave anterior: se sobrescribe con lo local
+}
+async function syncPush(){
+  await ensureBranch();
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},await getSyncKey(),new TextEncoder().encode(JSON.stringify(syncPayload())));
+  const file=JSON.stringify({v:1,iv:abToB64(iv),ct:abToB64(ct)});
+  const body={message:"progreso "+new Date().toISOString(),content:abToB64(new TextEncoder().encode(file)),branch:SYNC.branch};
+  if(SYNC.sha) body.sha=SYNC.sha;
+  const r=await gh(`/contents/${SYNC.path}`,{method:"PUT",body:JSON.stringify(body)});
+  if(r.status===409||r.status===422) return "conflict";
+  if(!r.ok) throw ghErr(r,"guardar tu progreso");
+  SYNC.sha=(await r.json()).content.sha; S.syncBase=S.updatedAt; saveLocal(); return "ok";
+}
+function uniq(a,keyFn){ const m=new Map(); arr(a).forEach(x=>{ if(x) m.set(keyFn(x),x); }); return [...m.values()]; }
+function mergeStates(L,R,preferR){ // L = local con cambios sin subir, R = remoto con cambios de otro dispositivo
+  const newer=preferR?R:((L.updatedAt||0)>=(R.updatedAt||0)?L:R), out={...L,...R,...(preferR?{}:L)};
+  ["level","skills","prefs","name","placementDone"].forEach(k=>{ if(newer[k]!==undefined) out[k]=newer[k]; });
+  out.placementDone=!!(L.placementDone||R.placementDone);
+  out.xp=Math.max(L.xp||0,R.xp||0);
+  out.startDate=[L.startDate,R.startDate].filter(Boolean).sort()[0];
+  out.days={...(R.days||{})};
+  for(const [k,d] of Object.entries(L.days||{})){ const r=out.days[k]; out.days[k]=!r?d:{...d,tasks:d.tasks.map((t,i)=>({...t,done:t.done||!!r.tasks?.[i]?.done}))}; }
+  out.evals=uniq([...arr(R.evals),...arr(L.evals)],e=>e.date+e.type+e.score).sort((a,b)=>a.date<b.date?-1:1);
+  out.mistakes=uniq([...arr(R.mistakes),...arr(L.mistakes)],m=>m.date+m.wrong).sort((a,b)=>a.date<b.date?1:-1).slice(0,300);
+  out.pronHist=uniq([...arr(R.pronHist),...arr(L.pronHist)],h=>h.k+h.score+h.date).slice(-200);
+  const vm=new Map(); [...arr(R.vocab),...arr(L.vocab)].forEach(v=>{ const k=(v.en||"").toLowerCase(), p=vm.get(k); if(!p||(v.t||0)>(p.t||0)) vm.set(k,v); }); out.vocab=[...vm.values()];
+  out.weekly={...(R.weekly||{}),...(L.weekly||{})};
+  return out;
+}
+function applyRemote(obj){ for(const k of Object.keys(S)) if(!DEVICE_FIELDS.includes(k)) delete S[k]; Object.assign(S,obj); }
+async function syncNow(){
+  if(!syncOn()) return;
+  if(SYNC.busy){ SYNC.again=true; return; }
+  SYNC.busy=true; setSync("busy");
+  try{
+    for(let i=0;i<4;i++){
+      const remote=await syncPull(), base=S.syncBase||0, localChanged=(S.updatedAt||0)>base;
+      let changedFromRemote=false;
+      if(remote && !remote.__oldKey && S.fresh){ applyRemote(mergeStates(syncPayload(),remote,true)); S.updatedAt=Date.now(); changedFromRemote=true; saveLocal(); }
+      else if(remote && !remote.__oldKey && (remote.updatedAt||0)>base){
+        if(localChanged){ applyRemote(mergeStates(syncPayload(),remote)); S.updatedAt=Date.now(); }
+        else { applyRemote(remote); S.updatedAt=remote.updatedAt||Date.now(); S.syncBase=S.updatedAt; changedFromRemote=true; }
+        saveLocal();
+      }
+      if(!remote || remote.__oldKey || (S.updatedAt||0)>(S.syncBase||0)){ if(await syncPush()==="conflict") continue; }
+      S.fresh=false; saveLocal();
+      if(changedFromRemote) refreshAfterSync();
+      break;
+    }
+    SYNC.last=Date.now(); SYNC.err=""; setSync("ok");
+  }catch(e){ SYNC.err=e.message; setSync("err"); }
+  SYNC.busy=false;
+  if(SYNC.again){ SYNC.again=false; setTimeout(syncNow,300); }
+}
+function scheduleSync(){ if(!syncOn()) return; clearTimeout(SYNC.timer); SYNC.timer=setTimeout(syncNow,4000); }
+function setSync(st){ SYNC.state=st; const el=$("#syncSt"); if(el) el.outerHTML=syncBadge(); const s2=$("#syncCard"); if(s2) s2.innerHTML=syncCardInner(); }
+function ago(t){ const s=Math.round((Date.now()-t)/1000); return s<10?"recién":s<60?`hace ${s} s`:s<3600?`hace ${Math.round(s/60)} min`:`hace ${Math.round(s/3600)} h`; }
+function syncBadge(){ if(!syncOn()) return `<span id="syncSt"></span>`;
+  const m={busy:["⏳","Sincronizando…","var(--ye)"],ok:["☁️",`Sincronizado ${SYNC.last?ago(SYNC.last):""}`,"var(--gr)"],err:["⚠️","Sin sincronizar","var(--re)"],off:["☁️","Conectando…","var(--mut)"]}[SYNC.state]||["☁️","","var(--mut)"];
+  return `<div id="syncSt" class="small" style="margin-top:4px;color:${m[2]}" title="${attr(SYNC.err)}">${m[0]} ${m[1]}</div>`; }
+function syncCardInner(){
+  if(!syncOn()) return `<p class="mut small">La sincronización se activa en la web publicada cuando existe el secreto <span class="mono">SYNC_TOKEN</span>.</p>`;
+  return `<div class="row sp"><div>${syncBadge()}<div class="small mut" style="margin-top:4px">Tu progreso se cifra con tu clave y se guarda en tu repositorio. Se sincroniza solo al hacer cambios y al volver a la app.</div>${SYNC.err?`<div class="err">${esc(SYNC.err)}</div>`:""}</div><button class="btn" onclick="syncNow()">🔄 Sincronizar ahora</button></div>`; }
+function refreshAfterSync(){ renderSide(); const a=document.activeElement; if(["home","plan","evals","errors","settings"].includes(view) && !(a && /INPUT|TEXTAREA/.test(a.tagName))) go(view); toast("☁️ Progreso actualizado desde otro dispositivo"); }
+
 /* ---------------- DATA: ROADMAP ---------------- */
 const ROADMAP = [
  {m:"2026-11",lvl:"A1",t:"Sonidos americanos + supervivencia",goals:["Dominar los 10 sonidos más difíciles para hispanohablantes (TH, R americana, I corta, V/B)","Presentarte, saludar, pedir en un café","Verbo to be, presente simple, 150 palabras clave"],ch:"Grábate presentándote 60 segundos sin pausas largas"},
@@ -577,7 +677,7 @@ function renderSide(){
   const lvlIdx=LEVELS.indexOf(S.level);
   $("#side").innerHTML = `<div class="brand"><div class="logo">F</div><div><b>FluentPath</b><small>American English · IA</small></div></div>`+
    NAV.map(([sec,items])=>`<div class="navsec">${sec}</div>`+items.map(([id,ic,n])=>`<div class="nav ${view===id?"on":""}" onclick="go('${id}')"><span class="ic">${ic}</span>${n}</div>`).join("")).join("")+
-   `<div class="foot" onclick="go('settings')" style="cursor:pointer"><div class="row sp"><span><span class="dot ${S._st==="ok"?"ok":S._st==="busy"?"busy":""}"></span>${S._st==="ok"?"IA lista":S._st==="busy"?"Conectando…":S._st==="bad"?"IA sin conexión":"IA en espera"}</span><b class="g">${S.level}</b></div>${S.active?`<div class="small mono" style="color:var(--cy);margin-top:4px">⚡ ${esc(S.active.model)}</div>`:""}
+   `<div class="foot" onclick="go('settings')" style="cursor:pointer"><div class="row sp"><span><span class="dot ${S._st==="ok"?"ok":S._st==="busy"?"busy":""}"></span>${S._st==="ok"?"IA lista":S._st==="busy"?"Conectando…":S._st==="bad"?"IA sin conexión":"IA en espera"}</span><b class="g">${S.level}</b></div>${syncBadge()}${S.active?`<div class="small mono" style="color:var(--cy);margin-top:4px">⚡ ${esc(S.active.model)}</div>`:""}
     <div class="small" style="margin-top:6px">${S.xp} XP · 🔥 ${streak()} días</div>
     <div class="bar" style="margin-top:8px"><i style="width:${((lvlIdx+1)/6)*100}%"></i></div></div>${window.FP_PROTECTED?`<button class="btn sm" style="margin-top:8px;width:100%;justify-content:center" onclick="fpLogout()">🔒 Cerrar sesión</button>`:""}`;
 }
@@ -928,7 +1028,7 @@ function drawVocab(){
   <div class="flash" onclick="vflip=!vflip;drawVocab()">${vflip?`<div><div>${esc(v.es)}</div><div class="small mut" style="margin-top:8px;font-weight:500">${esc(v.en)}</div>${v.ex?`<div class="small" style="margin-top:8px;font-weight:500;color:var(--cy)">${esc(v.ex)}</div>`:""}</div>`:`<div>${esc(v.en)}<div class="small mut" style="font-weight:500;margin-top:8px">Toca para ver la traducción</div></div>`}</div>
   <div class="small mut" style="text-align:center;margin-top:8px">⌨️ Espacio = voltear · 1/2/3 = No la sabía / Difícil / Fácil</div><div class="row" style="justify-content:center;margin-top:10px"><button class="btn" onclick="speak('${attr(v.en).replace(/'/g,"\\'")}')">🔊</button>${vflip?`<button class="btn" style="border-color:var(--re)" onclick="rate(0)">😵 No la sabía</button><button class="btn" style="border-color:var(--ye)" onclick="rate(1)">🤔 Difícil</button><button class="btn" style="border-color:var(--gr)" onclick="rate(2)">😎 Fácil</button>`:`<button class="btn p" onclick="vflip=true;drawVocab()">Mostrar</button>`}</div>`;
 }
-function rate(q){ const v=vq[vi]; v.box = q===0?0:Math.min(6,v.box+(q===2?2:1)); v.due=addDays(todayKey(),q===0?0:BOX_DAYS[v.box]); if(q===0) vq.push(v); addXP(2); bumpSkill("vocab",q===0?30:q===1?65:90); save(); vi++; vflip=false; drawVocab(); }
+function rate(q){ const v=vq[vi]; v.t=Date.now(); v.box = q===0?0:Math.min(6,v.box+(q===2?2:1)); v.due=addDays(todayKey(),q===0?0:BOX_DAYS[v.box]); if(q===0) vq.push(v); addXP(2); bumpSkill("vocab",q===0?30:q===1?65:90); save(); vi++; vflip=false; drawVocab(); }
 async function genVocab(){
   const el=$("#vGen"), topic=$("#vTopic").value||S.prefs.interests.join(", "); el.innerHTML=`<div class="card" style="margin-top:16px">${loader()}</div>`;
   try{ const r=await ai(`Dame 10 palabras/expresiones de inglés americano MUY útiles para nivel ${S.level} sobre: ${topic}. Evita estas que ya tengo: ${S.vocab.slice(-60).map(v=>v.en).join(", ")}. JSON: {"words":[{"en":"","es":"","ex":"frase de ejemplo natural en inglés"}]}`,{json:true,temp:0.9,schema:SCH.words,normalize:N.list("words"),validate:r=>r.words.length>0});
@@ -1123,6 +1223,7 @@ VIEWS.settings = () => {
    <label class="lb">Estilo de aprendizaje</label><select id="sStyle">${["Mixto","Visual (tablas, ejemplos)","Auditivo (escuchar y repetir)","Conversacional (hablar mucho)","Analítico (reglas y gramática)","Divertido (humor, cultura pop)"].map(s=>`<option ${s===S.prefs.style?"selected":""}>${s}</option>`).join("")}</select>
    <label class="lb">Velocidad de voz: <span id="rv">${S.prefs.rate}</span></label><input type="range" id="sRate" min="0.5" max="1.3" step="0.05" value="${S.prefs.rate}" oninput="$('#rv').textContent=this.value" style="padding:0">
    <button class="btn p" style="margin-top:14px" onclick="saveProfile()">Guardar perfil</button></div></div>
+   <div class="card glow" style="margin-top:16px"><h2>☁️ Sincronización entre dispositivos</h2><div id="syncCard">${syncCardInner()}</div></div>
    <div class="card" style="margin-top:16px"><h2>💾 Respaldo</h2><p class="mut small">Tu progreso vive en este navegador. Exporta un respaldo semanal para no perderlo o para pasarlo a otro equipo.</p>
    <div class="row" style="margin-top:10px"><button class="btn" onclick="exportData()">⬇️ Exportar progreso</button><label class="btn">⬆️ Importar<input type="file" accept=".json" class="hide" onchange="importData(this.files[0])"></label><button class="btn" style="border-color:var(--re);color:var(--re)" onclick="if(confirm('¿Borrar TODO tu progreso? No se puede deshacer.')){localStorage.removeItem(STORE);load();go('home')}">🗑️ Reiniciar</button></div></div>`);
 };
@@ -1133,7 +1234,7 @@ async function testAI(){ saveAI(); S.active=null; $("#sOut").innerHTML=loader("P
   catch(e){ $("#sOut").innerHTML=errBox(e); } }
 function saveProfile(){ S.name=$("#sName").value.trim(); S.level=$("#sLvl").value; S.prefs.interests=[...document.querySelectorAll("#sInt .chip.on")].map(c=>c.textContent); S.prefs.style=$("#sStyle").value; S.prefs.rate=Number($("#sRate").value); save(); renderSide(); toast("✅ Perfil guardado. La IA ya se adapta a ti."); }
 function exportData(){ const b=new Blob([JSON.stringify({...S,apiKey:""},null,2)],{type:"application/json"}); const a=document.createElement("a"); a.href=URL.createObjectURL(b); a.download=`fluentpath-${todayKey()}.json`; a.click(); }
-function importData(f){ if(!f) return; f.text().then(t=>{ const d=JSON.parse(t); const key=S.apiKey; S=Object.assign(defState(),d); if(!S.apiKey) S.apiKey=key; save(); toast("✅ Progreso importado"); go("home"); }).catch(()=>toast("Archivo inválido")); }
+function importData(f){ if(!f) return; f.text().then(t=>{ const d=JSON.parse(t); const key=S.apiKey; S=Object.assign(defState(),d); S.fresh=false; S.syncBase=0; if(!S.apiKey) S.apiKey=key; save(); toast("✅ Progreso importado"); go("home"); }).catch(()=>toast("Archivo inválido")); }
 
 /* ---------- INIT ---------- */
 function fpLogout(){ try{ localStorage.removeItem("fp_sess"); sessionStorage.removeItem("fp_sess"); }catch(e){} location.reload(); }
@@ -1150,6 +1251,7 @@ document.addEventListener("keydown",e=>{
 });
 load(); ensureDay(); renderSide(); go("home");
 if(S.apiKey) autoPick(!S.active).catch(()=>{});
+if(syncOn()){ syncNow(); document.addEventListener("visibilitychange",()=>syncNow()); setInterval(()=>{ if(document.visibilityState==="visible") syncNow(); },180000); setInterval(()=>{ const e=$("#syncSt"); if(e&&SYNC.state==="ok") e.outerHTML=syncBadge(); },30000); }
 </script>
 </body>
 </html>

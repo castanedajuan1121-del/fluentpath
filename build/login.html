@@ -72,15 +72,15 @@ button.go:hover{transform:translateY(-1px)}button.go:disabled{opacity:.7;cursor:
     var pt = await crypto.subtle.decrypt({name:"AES-GCM", iv:b64(P.iv)}, key, b64(P.ct));
     return dec.decode(pt);
   }
-  function launch(html){
-    window.FP_PROTECTED = true;
+  function launch(html,raw){
+    window.FP_PROTECTED = true; window.FP_KEY = raw;
     document.open(); document.write(html); document.close();
   }
   // Sesión recordada
   (async function(){
     var s = store.get(); if(!s) return;
     document.getElementById("boot").style.display="grid";
-    try{ var k = await crypto.subtle.importKey("raw", b64(s), {name:"AES-GCM"}, true, ["decrypt"]); launch(await open(k)); }
+    try{ var k = await crypto.subtle.importKey("raw", b64(s), {name:"AES-GCM"}, true, ["decrypt"]); launch(await open(k), s); }
     catch(e){ store.del(); document.getElementById("boot").style.display="none"; }
   })();
   var f=document.getElementById("f"), b=document.getElementById("b"), m=document.getElementById("m"), fails=0;
@@ -92,8 +92,9 @@ button.go:hover{transform:translateY(-1px)}button.go:disabled{opacity:.7;cursor:
     try{
       if(fails>=3) await new Promise(function(r){ setTimeout(r, Math.min(15000, 1500*Math.pow(2,fails-3))); });
       var k = await derive(u,p), html = await open(k);
-      store.set(tob64(await crypto.subtle.exportKey("raw", k)), rem);
-      launch(html);
+      var raw = tob64(await crypto.subtle.exportKey("raw", k));
+      store.set(raw, rem);
+      launch(html, raw);
     }catch(e){
       fails++; b.disabled=false; b.textContent="Entrar";
       m.textContent = (window.crypto && crypto.subtle) ? "Usuario o clave incorrectos." : "Tu navegador no soporta el cifrado necesario. Abre la página con https.";

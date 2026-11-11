@@ -27,6 +27,8 @@ jobs:
           APP_USER: ${{ secrets.APP_USER }}
           APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_REPO: ${{ github.repository }}
         run: node build/build.mjs
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

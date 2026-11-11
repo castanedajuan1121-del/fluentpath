@@ -18,7 +18,14 @@ if (pass.length < 10) fail("APP_PASSWORD debe tener al menos 10 caracteres.");
 if (!key) console.warn("⚠️  Sin GEMINI_KEY: la app pedirá la key en Ajustes.");
 if (/["\\<\n]/.test(key)) fail("GEMINI_KEY tiene caracteres inválidos.");
 
-const app = readFileSync(join(root, "src/app.html"), "utf8").split("%%GEMINI_KEY%%").join(key);
+const syncToken = (process.env.SYNC_TOKEN || "").trim();
+const syncRepo = (process.env.SYNC_REPO || "").trim();
+if (/[^\w-]/.test(syncToken)) fail("SYNC_TOKEN tiene caracteres inválidos.");
+if (!syncToken) console.warn("⚠️  Sin SYNC_TOKEN: el progreso no se sincronizará entre dispositivos.");
+const app = readFileSync(join(root, "src/app.html"), "utf8")
+  .split("%%GEMINI_KEY%%").join(key)
+  .split("%%SYNC_TOKEN%%").join(syncToken)
+  .split("%%SYNC_REPO%%").join(syncToken ? syncRepo : "");
 if (key && !app.includes(key)) fail("No se pudo inyectar la key.");
 
 const enc = new TextEncoder();

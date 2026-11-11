@@ -13,6 +13,7 @@ Nada sensible vive en este repositorio. Todo se guarda como **secretos de GitHub
 | `APP_USER` | Tu usuario para entrar |
 | `APP_PASSWORD` | Tu clave (mínimo 10 caracteres; usa una larga y única) |
 | `GEMINI_KEY` | Tu API key de Gemini (AI Studio `AIza…` o Vertex `AQ.…`) |
+| `SYNC_TOKEN` | Token de GitHub (fine-grained) con **Contents: Read and write** solo sobre este repo. Sincroniza tu progreso entre dispositivos |
 
 ## Cambiar usuario, clave o API key
 
@@ -28,4 +29,6 @@ En 1–2 minutos la web queda actualizada y la sesión anterior se cierra en tod
 - `build/build.mjs` — inyecta la key y cifra la app.
 - `.github/workflows/deploy.yml` — publica en GitHub Pages en cada push.
 
-Tu progreso de aprendizaje se guarda en el navegador de cada dispositivo. Usa **Ajustes → Exportar progreso** para respaldarlo o moverlo a otro equipo.
+## ☁️ Sincronización
+
+Tu progreso se cifra con tu clave (AES-256-GCM) y se guarda en la rama `progress` de este repo (`progress.enc.json`). GitHub solo ve datos cifrados. Se sincroniza al hacer cambios, al volver a la app y cada 3 minutos; los cambios hechos en dos dispositivos a la vez se combinan sin perder nada.
